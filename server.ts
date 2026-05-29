@@ -73,7 +73,25 @@ function addMockCapturedPacket(config: PacketConfig) {
   let dst = 'N/A';
   let sumStr = '';
   
-  if (config.enabledLayers.includes('ARP') && config.layers.ARP) {
+  if (config.isStacked && config.stackedHeaders && config.stackedHeaders.length > 0) {
+    const list = config.stackedHeaders.map(h => h.type);
+    proto = list.join('/');
+    const ips = config.stackedHeaders.filter(h => h.type === 'IPV4' || h.type === 'IPV6');
+    if (ips.length > 0) {
+      src = ips[0].fields.src || '192.168.1.100';
+      dst = ips[0].fields.dst || '8.8.8.8';
+    }
+    const flowNode = config.stackedHeaders.find(h => h.type === 'TCP' || h.type === 'UDP' || h.type === 'VXLAN');
+    let extra = '';
+    if (flowNode) {
+      if (flowNode.type === 'TCP' || flowNode.type === 'UDP') {
+        extra = ` Ports:${flowNode.fields.sport}->${flowNode.fields.dport}`;
+      } else if (flowNode.type === 'VXLAN') {
+        extra = ` VNI:${flowNode.fields.vni || '5001'}`;
+      }
+    }
+    sumStr = `Stacked Encap: ${list.join(' / ')}${extra}` + (config.payloadLength ? ` | Len: ${config.payloadLength}` : '');
+  } else if (config.enabledLayers.includes('ARP') && config.layers.ARP) {
     proto = 'ARP';
     src = config.layers.ARP.psrc;
     dst = config.layers.ARP.pdst;

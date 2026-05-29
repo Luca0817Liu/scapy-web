@@ -1,4 +1,4 @@
-import { PacketConfig, LayerType } from './types.js';
+import { PacketConfig, LayerType, HeaderConfig } from './types.js';
 
 // Helper: Convert MAC address (e.g., "00:11:22:33:44:55") to Buffer
 export function macToBytes(mac: string): Buffer {
@@ -451,6 +451,462 @@ export function generateScapyScript(config: PacketConfig, sendConf: any): string
     } else {
       scapyLines.push(`        send(pkt${ifaceParam}, verbose=False)`);
     }
+    scapyLines.push('        sent += 1');
+    scapyLines.push('        print(f"\\r[+] 累计已发送: {sent} 个报文", end="", flush=True)');
+    scapyLines.push('        time.sleep(interval)');
+    scapyLines.push('except KeyboardInterrupt:');
+    scapyLines.push('    print("\\n[-] 用户停止发包。")');
+  }
+  
+  return scapyLines.join('\n');
+}
+
+export function buildStackedPacket(config: PacketConfig): {
+  buffer: Buffer;
+  layersInfo: string[];
+} {
+  const layersInfo: string[] = [];
+  const buffers: Buffer[] = [];
+  
+  if (!config.stackedHeaders || config.stackedHeaders.length === 0) {
+    const payload = getPayloadBuffer(config);
+    return { buffer: payload, layersInfo: ['Only RAW Payload present'] };
+  }
+
+  for (let i = 0; i < config.stackedHeaders.length; i++) {
+    const hdr = config.stackedHeaders[i];
+    const fields = hdr.fields;
+    
+    if (hdr.type === 'ETHERNET') {
+      const buf = Buffer.alloc(14);
+      const dstEth = fields.dst || 'ff:ff:ff:ff:ff:ff';
+      macToBytes(dstEth).copy(buf, 0);
+      const srcEth = fields.src || '00:11:22:33:44:55';
+      macToBytes(srcEth).copy(buf, 6);
+      let ethType = parseInt(fields.type || '0x0800');
+      if (isNaN(ethType)) ethType = 0x0800;
+      buf.writeUInt16BE(ethType, 12);
+      
+      buffers.push(buf);
+      layersInfo.push(`Ethernet Header: Src ${srcEth} -> Dst ${dstEth} (Type: 0x${ethType.toString(16).padStart(4, '0')})`);
+    }
+    else if (hdr.type === 'ARP') {
+      const buf = Buffer.alloc(28);
+      let hwtype = parseInt(fields.hwtype || '1');
+      buf.writeUInt16BE(isNaN(hwtype) ? 1 : hwtype, 0);
+      let ptype = parseInt(fields.ptype || '0x0800');
+      buf.writeUInt16BE(isNaN(ptype) ? 0x0800 : ptype, 2);
+      let hwlen = parseInt(fields.hwlen || '6');
+      buf.writeUInt8(isNaN(hwlen) ? 6 : hwlen, 4);
+      let plen = parseInt(fields.plen || '4');
+      buf.writeUInt8(isNaN(plen) ? 4 : plen, 5);
+      let op = parseInt(fields.op || '1');
+      buf.writeUInt16BE(isNaN(op) ? 1 : op, 6);
+      const hwsrc = fields.hwsrc || '00:11:22:33:44:55';
+      macToBytes(hwsrc).copy(buf, 8);
+      const psrc = fields.psrc || '192.168.1.1';
+      ipv4ToBytes(psrc).copy(buf, 14);
+      const hwdst = fields.hwdst || '00:00:00:00:00:00';
+      macToBytes(hwdst).copy(buf, 18);
+      const pdst = fields.pdst || '192.168.1.254';
+      ipv4ToBytes(pdst).copy(buf, 24);
+      
+      buffers.push(buf);
+      layersInfo.push(`ARP Header: Opcode ${op} (Sender: ${psrc}, Target: ${pdst})`);
+    }
+    else if (hdr.type === 'IPV4') {
+      const buf = Buffer.alloc(20);
+      let version = parseInt(fields.version || '4');
+      let ihl = parseInt(fields.ihl || '5');
+      buf.writeUInt8(((version & 0x0f) << 4) | (ihl & 0x0f), 0);
+      
+      let tos = parseInt(fields.tos || '0');
+      buf.writeUInt8(isNaN(tos) ? 0 : tos, 1);
+      
+      let len = parseInt(fields.len || '0');
+      buf.writeUInt16BE(isNaN(len) ? 0 : len, 2);
+      
+      let id = parseInt(fields.id || '12345');
+      buf.writeUInt16BE(isNaN(id) ? 12345 : id, 4);
+      
+      let frag = parseInt(fields.frag || '0');
+      let flagsVal = 0;
+      const flagsStr = fields.flags || '';
+      if (flagsStr.includes('DF')) flagsVal |= 0x4000;
+      if (flagsStr.includes('MF')) flagsVal |= 0x2000;
+      flagsVal |= (frag & 0x1fff);
+      buf.writeUInt16BE(flagsVal, 6);
+      
+      let ttl = parseInt(fields.ttl || '64');
+      buf.writeUInt8(isNaN(ttl) ? 64 : ttl, 8);
+      
+      let proto = parseInt(fields.proto || '17');
+      buf.writeUInt8(isNaN(proto) ? 17 : proto, 9);
+      
+      buf.writeUInt16BE(0, 10);
+      
+      const src = fields.src || '192.168.1.100';
+      const dst = fields.dst || '8.8.8.8';
+      ipv4ToBytes(src).copy(buf, 12);
+      ipv4ToBytes(dst).copy(buf, 16);
+      
+      const chk = computeChecksum(buf);
+      buf.writeUInt16BE(chk, 10);
+      
+      buffers.push(buf);
+      layersInfo.push(`IPv4 Header: Src ${src} -> Dst ${dst} (Proto: ${proto}, TTL: ${ttl})`);
+    }
+    else if (hdr.type === 'IPV6') {
+      const buf = Buffer.alloc(40);
+      let tc = parseInt(fields.tc || '0');
+      let fl = parseInt(fields.fl || '0');
+      
+      const vTcF = (0x60000000 | ((tc & 0xff) << 20) | (fl & 0xfffff)) >>> 0;
+      buf.writeUInt32BE(vTcF, 0);
+      
+      let plen = parseInt(fields.plen || '0');
+      buf.writeUInt16BE(isNaN(plen) ? 0 : plen, 4);
+      
+      let nh = parseInt(fields.nh || '17');
+      buf.writeUInt8(isNaN(nh) ? 17 : nh, 6);
+      
+      let hlim = parseInt(fields.hlim || '64');
+      buf.writeUInt8(isNaN(hlim) ? 64 : hlim, 7);
+      
+      const src = fields.src || 'fe80::1';
+      const dst = fields.dst || '2001:4860:4860::8888';
+      ipv6ToBytes(src).copy(buf, 8);
+      ipv6ToBytes(dst).copy(buf, 24);
+      
+      buffers.push(buf);
+      layersInfo.push(`IPv6 Header: Src ${src} -> Dst ${dst} (NextHdr: ${nh})`);
+    }
+    else if (hdr.type === 'TCP') {
+      const buf = Buffer.alloc(20);
+      let sport = parseInt(fields.sport || '12345');
+      let dport = parseInt(fields.dport || '80');
+      buf.writeUInt16BE(isNaN(sport) ? 12345 : sport, 0);
+      buf.writeUInt16BE(isNaN(dport) ? 80 : dport, 2);
+      
+      let seq = parseInt(fields.seq || '1000');
+      buf.writeUInt32BE(isNaN(seq) ? 1000 : seq, 4);
+      
+      let ack = parseInt(fields.ack || '0');
+      buf.writeUInt32BE(isNaN(ack) ? 0 : ack, 8);
+      
+      let offset = parseInt(fields.offset || '5');
+      let flagVal = 0;
+      const flagsStr = fields.flags || 'SYN';
+      if (flagsStr.includes('FIN')) flagVal |= 0x01;
+      if (flagsStr.includes('SYN')) flagVal |= 0x02;
+      if (flagsStr.includes('RST')) flagVal |= 0x04;
+      if (flagsStr.includes('PSH')) flagVal |= 0x08;
+      if (flagsStr.includes('ACK')) flagVal |= 0x10;
+      if (flagsStr.includes('URG')) flagVal |= 0x20;
+      
+      buf.writeUInt16BE(((offset & 0x0f) << 12) | flagVal, 12);
+      
+      let window = parseInt(fields.window || '8192');
+      buf.writeUInt16BE(isNaN(window) ? 8192 : window, 14);
+      
+      buf.writeUInt16BE(0, 16);
+      
+      let urgptr = parseInt(fields.urgptr || '0');
+      buf.writeUInt16BE(isNaN(urgptr) ? 0 : urgptr, 18);
+      
+      const chk = computeChecksum(buf);
+      buf.writeUInt16BE(chk, 16);
+      
+      buffers.push(buf);
+      layersInfo.push(`TCP Header: Sport ${sport} -> Dport ${dport} (Flags: ${flagsStr}, Seq: ${seq})`);
+    }
+    else if (hdr.type === 'UDP') {
+      const buf = Buffer.alloc(8);
+      let sport = parseInt(fields.sport || '12345');
+      let dport = parseInt(fields.dport || '4789');
+      buf.writeUInt16BE(isNaN(sport) ? 12345 : sport, 0);
+      buf.writeUInt16BE(isNaN(dport) ? 4789 : dport, 2);
+      
+      let len = parseInt(fields.len || '0');
+      buf.writeUInt16BE(isNaN(len) ? 8 : len, 4);
+      
+      buf.writeUInt16BE(0, 6);
+      
+      buffers.push(buf);
+      layersInfo.push(`UDP Header: Sport ${sport} -> Dport ${dport}`);
+    }
+    else if (hdr.type === 'ICMP') {
+      const buf = Buffer.alloc(8);
+      let type = parseInt(fields.type || '8');
+      let code = parseInt(fields.code || '0');
+      buf.writeUInt8(isNaN(type) ? 8 : type, 0);
+      buf.writeUInt8(isNaN(code) ? 0 : code, 1);
+      buf.writeUInt16BE(0, 2);
+      
+      let id = parseInt(fields.id || '1234');
+      buf.writeUInt16BE(isNaN(id) ? 1234 : id, 4);
+      
+      let seq = parseInt(fields.seq || '1');
+      buf.writeUInt16BE(isNaN(seq) ? 1 : seq, 6);
+      
+      const chk = computeChecksum(buf);
+      buf.writeUInt16BE(chk, 2);
+      
+      buffers.push(buf);
+      layersInfo.push(`ICMP Header: Type ${type}, Code ${code}`);
+    }
+    else if (hdr.type === 'VXLAN') {
+      const buf = Buffer.alloc(8);
+      let flags = parseInt(fields.flags || '0x08');
+      if (isNaN(flags)) flags = 0x08;
+      buf.writeUInt8(flags, 0);
+      
+      let rsvd1 = parseInt(fields.rsvd1 || '0');
+      if (isNaN(rsvd1)) rsvd1 = 0;
+      buf.writeUInt8((rsvd1 >> 16) & 0xff, 1);
+      buf.writeUInt8((rsvd1 >> 8) & 0xff, 2);
+      buf.writeUInt8(rsvd1 & 0xff, 3);
+      
+      let vni = parseInt(fields.vni || '5001');
+      if (isNaN(vni)) vni = 5001;
+      buf.writeUInt8((vni >> 16) & 0xff, 4);
+      buf.writeUInt8((vni >> 8) & 0xff, 5);
+      buf.writeUInt8(vni & 0xff, 6);
+      
+      let rsvd2 = parseInt(fields.rsvd2 || '0');
+      buf.writeUInt8(isNaN(rsvd2) ? 0 : rsvd2, 7);
+      
+      buffers.push(buf);
+      layersInfo.push(`VXLAN Header: VNI ${vni}`);
+    }
+  }
+
+  const payloadBuf = getPayloadBuffer(config);
+  if (payloadBuf.length > 0) {
+    buffers.push(payloadBuf);
+    layersInfo.push(`User Custom Payload: ${payloadBuf.length} bytes`);
+  }
+
+  const finalBuf = Buffer.concat(buffers);
+
+  let currentOffset = 0;
+  for (let i = 0; i < config.stackedHeaders.length; i++) {
+    const hdr = config.stackedHeaders[i];
+    const headerLen = getHeaderLength(hdr.type);
+    
+    if (hdr.type === 'IPV4' && (hdr.fields.len === '0' || !hdr.fields.len)) {
+      const totalLen = finalBuf.length - currentOffset;
+      if (currentOffset + 4 <= finalBuf.length) {
+        finalBuf.writeUInt16BE(totalLen, currentOffset + 2);
+        const ipHeaderSlice = finalBuf.subarray(currentOffset, currentOffset + 20);
+        ipHeaderSlice.writeUInt16BE(0, 10);
+        const chk = computeChecksum(ipHeaderSlice);
+        ipHeaderSlice.writeUInt16BE(chk, 10);
+      }
+    }
+    else if (hdr.type === 'UDP' && (hdr.fields.len === '0' || !hdr.fields.len)) {
+      const totalLen = finalBuf.length - currentOffset;
+      if (currentOffset + 6 <= finalBuf.length) {
+        finalBuf.writeUInt16BE(totalLen, currentOffset + 4);
+      }
+    }
+    currentOffset += headerLen;
+  }
+
+  return { buffer: finalBuf, layersInfo };
+}
+
+function getHeaderLength(type: string): number {
+  switch (type) {
+    case 'ETHERNET': return 14;
+    case 'ARP': return 28;
+    case 'IPV4': return 20;
+    case 'IPV6': return 40;
+    case 'TCP': return 20;
+    case 'UDP': return 8;
+    case 'ICMP': return 8;
+    case 'VXLAN': return 8;
+    default: return 0;
+  }
+}
+
+function getPayloadBuffer(config: PacketConfig): Buffer {
+  const format = config.payloadFormat || 'string';
+  const val = config.payloadValue || '';
+  const length = config.payloadLength || 0;
+  
+  let baseBuf = Buffer.alloc(0);
+  if (format === 'hex') {
+    const clean = val.replace(/\s+/g, '');
+    try {
+      baseBuf = Buffer.from(clean, 'hex');
+    } catch {
+      baseBuf = Buffer.alloc(0);
+    }
+  } else {
+    baseBuf = Buffer.from(val, 'utf8');
+  }
+
+  if (length > baseBuf.length) {
+    const padded = Buffer.alloc(length);
+    baseBuf.copy(padded, 0);
+    return padded;
+  }
+  return baseBuf;
+}
+
+export function generateScapyStackedScript(config: PacketConfig, sendConf: any): string {
+  let scapyLines: string[] = ['#!/usr/bin/env python3', 'import time', 'import sys', 'from scapy.all import *', ''];
+  let pktLayers: string[] = [];
+  
+  if (config.stackedHeaders && config.stackedHeaders.length > 0) {
+    for (const hdr of config.stackedHeaders) {
+      const fields = hdr.fields;
+      if (hdr.type === 'ETHERNET') {
+        const dst = fields.dst || 'ff:ff:ff:ff:ff:ff';
+        const src = fields.src || '00:11:22:33:44:55';
+        let t = fields.type || '0x0800';
+        pktLayers.push(`Ether(dst="${dst}", src="${src}", type=${t})`);
+      }
+      else if (hdr.type === 'ARP') {
+        const hwtype = fields.hwtype || '1';
+        const ptype = fields.ptype || '0x0800';
+        const hwlen = fields.hwlen || '6';
+        const plen = fields.plen || '4';
+        const op = fields.op || '1';
+        const hwsrc = fields.hwsrc || '00:11:22:33:44:55';
+        const psrc = fields.psrc || '192.168.1.1';
+        const hwdst = fields.hwdst || '00:00:00:00:00:00';
+        const pdst = fields.pdst || '192.168.1.254';
+        pktLayers.push(`ARP(hwtype=${hwtype}, ptype=${ptype}, hwlen=${hwlen}, plen=${plen}, op=${op}, hwsrc="${hwsrc}", psrc="${psrc}", hwdst="${hwdst}", pdst="${pdst}")`);
+      }
+      else if (hdr.type === 'IPV4') {
+        const version = fields.version || '4';
+        const ihl = fields.ihl || '5';
+        const tos = fields.tos || '0';
+        const id = fields.id || '12345';
+        const flags = fields.flags || 'DF';
+        const frag = fields.frag || '0';
+        const ttl = fields.ttl || '64';
+        const proto = fields.proto || '17';
+        const src = fields.src || '192.168.1.100';
+        const dst = fields.dst || '8.8.8.8';
+        let flagsStr = flags === 'DF' ? 'DF' : flags === 'MF' ? 'MF' : '';
+        pktLayers.push(`IP(version=${version}, ihl=${ihl}, tos=${tos}, id=${id}, flags="${flagsStr}", frag=${frag}, ttl=${ttl}, proto=${proto}, src="${src}", dst="${dst}")`);
+      }
+      else if (hdr.type === 'IPV6') {
+        const version = fields.version || '6';
+        const tc = fields.tc || '0';
+        const fl = fields.fl || '0';
+        const nh = fields.nh || '17';
+        const hlim = fields.hlim || '64';
+        const src = fields.src || 'fe80::1';
+        const dst = fields.dst || '2001:4860:4860::8888';
+        pktLayers.push(`IPv6(version=${version}, tc=${tc}, fl=${fl}, nh=${nh}, hlim=${hlim}, src="${src}", dst="${dst}")`);
+      }
+      else if (hdr.type === 'TCP') {
+        const sport = fields.sport || '12345';
+        const dport = fields.dport || '80';
+        const seq = fields.seq || '1000';
+        const ack = fields.ack || '0';
+        const flags = fields.flags || 'SYN';
+        const window = fields.window || '8192';
+        const urgptr = fields.urgptr || '0';
+        const flagsList = flags.split(',').map((f: string) => f.trim()[0]).join('');
+        pktLayers.push(`TCP(sport=${sport}, dport=${dport}, seq=${seq}, ack=${ack}, flags="${flagsList}", window=${window}, urgptr=${urgptr})`);
+      }
+      else if (hdr.type === 'UDP') {
+        const sport = fields.sport || '12345';
+        const dport = fields.dport || '4789';
+        pktLayers.push(`UDP(sport=${sport}, dport=${dport})`);
+      }
+      else if (hdr.type === 'ICMP') {
+        const type = fields.type || '8';
+        const code = fields.code || '0';
+        const id = fields.id || '1234';
+        const seq = fields.seq || '1';
+        pktLayers.push(`ICMP(type=${type}, code=${code}, id=${id}, seq=${seq})`);
+      }
+      else if (hdr.type === 'VXLAN') {
+        const vni = fields.vni || '5001';
+        const flags = fields.flags || '0x08';
+        pktLayers.push(`VXLAN(vni=${vni}, flags=${flags})`);
+      }
+    }
+  }
+
+  const format = config.payloadFormat || 'string';
+  const val = config.payloadValue || '';
+  const length = config.payloadLength || 0;
+  if (val || length > 0) {
+    if (format === 'hex') {
+      const hexLiteral = val.replace(/\s+/g, '');
+      pktLayers.push(`Raw(load=bytes.fromhex("${hexLiteral}"))`);
+    } else {
+      const escaped = val.replace(/"/g, '\\"').replace(/\n/g, '\\n');
+      const padLen = Math.max(0, length - val.length);
+      pktLayers.push(`Raw(load="${escaped}" + "\\x00" * ${padLen})`);
+    }
+  }
+
+  scapyLines.push('# 1. 构造多层/VXLAN堆叠 自定义报文');
+  scapyLines.push(`pkt = ${pktLayers.join(' / ')}`);
+  scapyLines.push('');
+  scapyLines.push('print("=" * 60)');
+  scapyLines.push('print(" Visual Packet Studio - Stacked Standalone Packet Injector")');
+  scapyLines.push('print("=" * 60)');
+  scapyLines.push('print("[*] 组装的多层报文格式如下:")');
+  scapyLines.push('pkt.show()');
+  scapyLines.push('print("-" * 60)');
+  
+  const ifaceParam = sendConf.interfaceName && sendConf.interfaceName !== 'Any' ? `, iface="${sendConf.interfaceName}"` : '';
+  const intervalS = sendConf.intervalMs / 1000;
+  
+  scapyLines.push('# 2. 初始化发包控制');
+  scapyLines.push(`interval = ${intervalS}`);
+  scapyLines.push(`mode = "${sendConf.mode}"`);
+  
+  const hasEth = config.stackedHeaders && config.stackedHeaders.some(h => h.type === 'ETHERNET');
+  const sendCmd = hasEth ? 'sendp' : 'send';
+
+  if (sendConf.mode === 'single') {
+    scapyLines.push('print("[*] 正在发送 1 个自定义堆叠报文...")');
+    scapyLines.push(`${sendCmd}(pkt${ifaceParam}, verbose=True)`);
+  } else if (sendConf.mode === 'count') {
+    scapyLines.push(`count = ${sendConf.count}`);
+    scapyLines.push('print(f"[*] 准备发送 {count} 个自定义堆叠报文, 间隔: {interval} 秒...")');
+    scapyLines.push('sent = 0');
+    scapyLines.push('try:');
+    scapyLines.push('    for i in range(count):');
+    scapyLines.push(`        ${sendCmd}(pkt${ifaceParam}, verbose=False)`);
+    scapyLines.push('        sent += 1');
+    scapyLines.push('        print(f"\\r[+] 成功发送: {sent}/{count} 个报文 [{sent*100//count}%]", end="", flush=True)');
+    scapyLines.push('        if i < count - 1:');
+    scapyLines.push('            time.sleep(interval)');
+    scapyLines.push('    print("\\n[+] 发送完成！")');
+    scapyLines.push('except KeyboardInterrupt:');
+    scapyLines.push('    print("\\n[-] 用户手动中断发包！")');
+  } else if (sendConf.mode === 'duration') {
+    scapyLines.push(`duration = ${sendConf.durationSec}`);
+    scapyLines.push('print(f"[*] 准备发包, 持续时间: {duration} 秒, 间隔: {interval} 秒...")');
+    scapyLines.push('start_time = time.time()');
+    scapyLines.push('sent = 0');
+    scapyLines.push('try:');
+    scapyLines.push('    while (time.time() - start_time) < duration:');
+    scapyLines.push(`        ${sendCmd}(pkt${ifaceParam}, verbose=False)`);
+    scapyLines.push('        sent += 1');
+    scapyLines.push('        elapsed = round(time.time() - start_time, 1)');
+    scapyLines.push('        print(f"\\r[+] 已耗时: {elapsed}s / {duration}s | 累计已发送: {sent} 个报文", end="", flush=True)');
+    scapyLines.push('        time.sleep(interval)');
+    scapyLines.push('    print("\\n[+] 定时发包完成！")');
+    scapyLines.push('except KeyboardInterrupt:');
+    scapyLines.push('    print("\\n[-] 用户手动中断发包！")');
+  } else {
+    scapyLines.push('print("[-] 正在循环发包中... 按 Ctrl+C 停止。")');
+    scapyLines.push('sent = 0');
+    scapyLines.push('try:');
+    scapyLines.push('    while True:');
+    scapyLines.push(`        ${sendCmd}(pkt${ifaceParam}, verbose=False)`);
     scapyLines.push('        sent += 1');
     scapyLines.push('        print(f"\\r[+] 累计已发送: {sent} 个报文", end="", flush=True)');
     scapyLines.push('        time.sleep(interval)');

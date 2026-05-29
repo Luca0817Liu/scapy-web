@@ -7,8 +7,32 @@ import {
 } from 'lucide-react';
 import { Header } from './components/Header.js';
 import { ConsoleLogs } from './components/ConsoleLogs.js';
-import { PacketConfig, LayerType, SendConfig, SendStats, CapturedPacket, LogItem, NetworkInterface, SavedTemplate } from './types.js';
+import { PacketConfig, LayerType, SendConfig, SendStats, CapturedPacket, LogItem, NetworkInterface, SavedTemplate, HeaderConfig } from './types.js';
 import { STANDARD_PRESETS, EMPTY_PACKET } from './presets.js';
+
+// Helper to provide default field values for individual headers in visual stacking composer
+const getHeaderDefaultFields = (type: string) => {
+  switch (type) {
+    case 'ETHERNET':
+      return { dst: 'ff:ff:ff:ff:ff:ff', src: '00:0c:29:ab:cd:ef', type: '0x0800' };
+    case 'ARP':
+      return { hwtype: '1', ptype: '0x0800', hwlen: '6', plen: '4', op: '1', hwsrc: '00:0c:29:ab:cd:ef', psrc: '192.168.1.102', hwdst: '00:00:00:00:00:00', pdst: '192.168.1.1' };
+    case 'IPV4':
+      return { version: '4', ihl: '5', tos: '0', len: '0', id: '12345', flags: 'DF', frag: '0', ttl: '64', proto: '17', src: '192.168.1.102', dst: '8.8.8.8' };
+    case 'IPV6':
+      return { tc: '0', fl: '0', plen: '0', nh: '17', hlim: '64', src: 'fe80::1', dst: '2001:4860:4860::8888' };
+    case 'TCP':
+      return { sport: '12345', dport: '80', seq: '1000', ack: '0', offset: '5', flags: 'SYN', window: '8192', urgptr: '0' };
+    case 'UDP':
+      return { sport: '12345', dport: '4789', len: '0' };
+    case 'ICMP':
+      return { type: '8', code: '0', id: '1122', seq: '1' };
+    case 'VXLAN':
+      return { flags: '0x08', rsvd1: '0', vni: '5001', rsvd2: '0' };
+    default:
+      return {};
+  }
+};
 
 export default function App() {
   // Connection states
@@ -87,6 +111,32 @@ export default function App() {
   const [selectedAgentOs, setSelectedAgentOs] = useState<'linux' | 'windows'>('linux');
   const [showHelpModal, setShowHelpModal] = useState<boolean>(false);
   const [isCopied, setIsCopied] = useState<boolean>(false);
+
+  // Screen and Stacking Wizard state
+  const [isSecondScreenActive, setIsSecondScreenActive] = useState<boolean>(false);
+  const [wizardHeaders, setWizardHeaders] = useState<HeaderConfig[]>([
+    { id: 'eth-1', type: 'ETHERNET', fields: { dst: 'ff:ff:ff:ff:ff:ff', src: '00:0c:29:ab:cd:ef', type: '0x0800' } },
+    { id: 'ip-1', type: 'IPV4', fields: { version: '4', ihl: '5', tos: '0', len: '0', id: '12345', flags: 'DF', frag: '0', ttl: '64', proto: '17', src: '192.168.1.102', dst: '8.8.8.8' } },
+    { id: 'udp-1', type: 'UDP', fields: { sport: '12345', dport: '4789', len: '0' } }
+  ]);
+  const [wizardStep, setWizardStep] = useState<'l2' | 'l3' | 'l4' | 'vxlan_or_done'>('vxlan_or_done');
+  const [payloadValue, setPayloadValue] = useState<string>('Hello Stacked Packet');
+  const [payloadFormat, setPayloadFormat] = useState<'string' | 'hex'>('string');
+  const [payloadLength, setPayloadLength] = useState<number>(0);
+
+  // Helper to re-compile packet when wizard values or layout change
+  useEffect(() => {
+    const updatedPacket: PacketConfig = {
+      ...packet,
+      isStacked: true,
+      stackedHeaders: wizardHeaders,
+      payloadValue: payloadValue,
+      payloadLength: payloadLength,
+      payloadFormat: payloadFormat
+    };
+    setPacket(updatedPacket);
+    triggerAnalysis(updatedPacket);
+  }, [wizardHeaders, payloadValue, payloadLength, payloadFormat]);
 
   // Initialize and check health/adapters list
   useEffect(() => {
@@ -260,18 +310,89 @@ export default function App() {
   // Preset quick-loading action triggered on list selections
   const handleLoadPreset = (presetPacket: PacketConfig) => {
     const cloned = JSON.parse(JSON.stringify(presetPacket));
-    setPacket(cloned);
-    triggerAnalysis(cloned);
-    // Auto-select corresponding layer tab for visual guidance
-    if (cloned.enabledLayers.includes('ARP')) {
-      setActiveLayer('ARP');
-    } else if (cloned.enabledLayers.includes('TCP')) {
-      setActiveLayer('TCP');
-    } else if (cloned.enabledLayers.includes('UDP')) {
-      setActiveLayer('UDP');
+    
+    // Convert regular or pre-coded layers into stacked representation
+    let hw: HeaderConfig[] = [];
+    if (cloned.isStacked && cloned.stackedHeaders) {
+      hw = JSON.parse(JSON.stringify(cloned.stackedHeaders));
     } else {
-      setActiveLayer('ETHERNET');
+      cloned.enabledLayers.forEach((l: any) => {
+        const fields: any = {};
+        if (l === 'ETHERNET' && cloned.layers.ETHERNET) {
+          fields.dst = cloned.layers.ETHERNET.dst;
+          fields.src = cloned.layers.ETHERNET.src;
+          fields.type = String(cloned.layers.ETHERNET.type);
+        } else if (l === 'ARP' && cloned.layers.ARP) {
+          fields.hwtype = String(cloned.layers.ARP.hwtype);
+          fields.ptype = String(cloned.layers.ARP.ptype);
+          fields.hwlen = String(cloned.layers.ARP.hwlen);
+          fields.plen = String(cloned.layers.ARP.plen);
+          fields.op = String(cloned.layers.ARP.op);
+          fields.hwsrc = cloned.layers.ARP.hwsrc;
+          fields.psrc = cloned.layers.ARP.psrc;
+          fields.hwdst = cloned.layers.ARP.hwdst;
+          fields.pdst = cloned.layers.ARP.pdst;
+        } else if (l === 'IPV4' && cloned.layers.IPV4) {
+          fields.version = String(cloned.layers.IPV4.version);
+          fields.tos = String(cloned.layers.IPV4.tos);
+          fields.id = String(cloned.layers.IPV4.id);
+          fields.flags = cloned.layers.IPV4.flags;
+          fields.frag = String(cloned.layers.IPV4.frag);
+          fields.ttl = String(cloned.layers.IPV4.ttl);
+          fields.proto = String(cloned.layers.IPV4.proto);
+          fields.src = cloned.layers.IPV4.src;
+          fields.dst = cloned.layers.IPV4.dst;
+        } else if (l === 'IPV6' && cloned.layers.IPV6) {
+          fields.version = String(cloned.layers.IPV6.version);
+          fields.tc = String(cloned.layers.IPV6.tc);
+          fields.fl = String(cloned.layers.IPV6.fl);
+          fields.nh = String(cloned.layers.IPV6.nh);
+          fields.hlim = String(cloned.layers.IPV6.hlim);
+          fields.src = cloned.layers.IPV6.src;
+          fields.dst = cloned.layers.IPV6.dst;
+        } else if (l === 'TCP' && cloned.layers.TCP) {
+          fields.sport = String(cloned.layers.TCP.sport);
+          fields.dport = String(cloned.layers.TCP.dport);
+          fields.seq = String(cloned.layers.TCP.seq);
+          fields.ack = String(cloned.layers.TCP.ack);
+          fields.flags = cloned.layers.TCP.flags.join(',');
+          fields.window = String(cloned.layers.TCP.window);
+          fields.urgptr = String(cloned.layers.TCP.urgptr);
+        } else if (l === 'UDP' && cloned.layers.UDP) {
+          fields.sport = String(cloned.layers.UDP.sport);
+          fields.dport = String(cloned.layers.UDP.dport);
+        } else if (l === 'ICMP' && cloned.layers.ICMP) {
+          fields.type = String(cloned.layers.ICMP.type);
+          fields.code = String(cloned.layers.ICMP.code);
+          fields.id = String(cloned.layers.ICMP.id);
+          fields.seq = String(cloned.layers.ICMP.seq);
+        }
+        hw.push({
+          id: `${l.toLowerCase()}-${Math.random().toString(36).substring(4)}`,
+          type: l as any,
+          fields
+        });
+      });
     }
+
+    setWizardHeaders(hw);
+    setPayloadValue(cloned.payloadValue || cloned.layers?.RAW?.payload || '');
+    setPayloadLength(cloned.payloadLength || 0);
+    setPayloadFormat(cloned.payloadFormat || cloned.layers?.RAW?.format || 'string');
+
+    // Set the finalized state
+    setPacket({
+      ...cloned,
+      isStacked: true,
+      stackedHeaders: hw,
+      payloadValue: cloned.payloadValue || cloned.layers?.RAW?.payload || '',
+      payloadLength: cloned.payloadLength || 0,
+      payloadFormat: cloned.payloadFormat || cloned.layers?.RAW?.format || 'string'
+    });
+
+    // Directly open Second Screen to let them review/modify parameters
+    setIsSecondScreenActive(true);
+    setWizardStep('vxlan_or_done'); // goes straight to tweak-parameters view!
     
     // Log info
     setLogs(prev => [
@@ -280,7 +401,7 @@ export default function App() {
         id: Math.random().toString(),
         timestamp: new Date().toLocaleTimeString(),
         level: 'info',
-        message: `加载报文模板: "${cloned.name}" 已填充各协议字段。`
+        message: `加载报文模板: "${cloned.name}" 已填充并转换至堆叠协议。`
       }
     ]);
   };
@@ -510,76 +631,302 @@ export default function App() {
 
           {/* TAB 1: Visual Protocol Stack Designer */}
           {activeTab === 'build' && (
-            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-              
-              {/* Left Column: Stack Selector List */}
-              <div className="lg:col-span-4 bg-[#0B0F19] rounded-xl border border-[#1E293B] p-4 flex flex-col space-y-3">
-                <div className="text-xs font-bold text-slate-400 uppercase tracking-widest font-mono border-b border-[#1E293B] pb-2 flex items-center justify-between">
-                  <span>协议层级堆叠拓扑</span>
-                  <Layers className="w-3.5 h-3.5 text-slate-500" />
-                </div>
-
-                <div className="space-y-2">
-                  {[
-                    { id: 'ETHERNET', label: 'Ethernet II (链路层)', color: 'border-blue-500' },
-                    { id: 'ARP', label: 'ARP (地址转换协议)', color: 'border-[#FB923C]' },
-                    { id: 'IPV4', label: 'IPv4 (网络层主载荷)', color: 'border-indigo-500' },
-                    { id: 'IPV6', label: 'IPv6 (下一代网络层)', color: 'border-violet-500' },
-                    { id: 'TCP', label: 'TCP (面向连接传输)', color: 'border-emerald-500' },
-                    { id: 'UDP', label: 'UDP (无连接高速传输)', color: 'border-pink-500' },
-                    { id: 'ICMP', label: 'ICMP (路由控制诊断)', color: 'border-teal-500' },
-                    { id: 'RAW', label: 'RAW Payload (原始荷载)', color: 'border-amber-500' }
-                  ].map((layer) => {
-                    const isEnabled = packet.enabledLayers.includes(layer.id as LayerType);
-                    const isActive = activeLayer === layer.id;
-                    
-                    return (
-                      <div
-                        key={layer.id}
-                        className={`flex items-center justify-between p-2.5 rounded-lg border transition-all ${
-                          isActive 
-                            ? 'bg-slate-800/40 border-blue-500 shadow-sm' 
-                            : 'bg-[#101726]/60 border-[#1E293B] hover:border-slate-800'
-                        }`}
-                      >
-                        <button
-                          onClick={() => setActiveLayer(layer.id as LayerType)}
-                          className="flex items-center space-x-2 text-xs font-bold text-left flex-1 cursor-pointer"
-                        >
-                          <div className={`w-2.5 h-2.5 rounded-full ${isEnabled ? 'bg-emerald-500' : 'bg-slate-700'}`} />
-                          <span className={`${isActive ? 'text-blue-400' : 'text-slate-300'}`}>
-                            {layer.label}
-                          </span>
-                        </button>
-                        
-                        <div className="flex items-center space-x-1">
-                          {layer.id !== 'ETHERNET' && (
-                            <button
-                              onClick={() => toggleLayerEnabled(layer.id as LayerType)}
-                              className={`text-[9px] px-2 py-0.5 rounded uppercase font-mono font-bold tracking-wider cursor-pointer border ${
-                                isEnabled 
-                                  ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' 
-                                  : 'bg-slate-800 text-slate-500 border-transparent hover:border-slate-700'
-                              }`}
-                            >
-                              {isEnabled ? '已激活' : '不加载'}
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-
-                <div className="pt-2">
-                  <div className="bg-[#121927] border border-[#1E293B] p-2.5 rounded-lg text-[11px] text-slate-400">
-                    <span className="font-bold text-slate-300">高级逻辑验证:</span> Scapy 会自动计算并填充未指定的长度和校验和参数。无需为了二层帧/三层路由重复编写繁琐填充。
+            <div className="w-full">
+              {!isSecondScreenActive ? (
+                /* SCREEN 1: Simple Portal centered interface */
+                <div className="bg-[#0B0F19] rounded-2xl border border-[#1E293B] p-8 md:p-12 text-center flex flex-col items-center justify-center space-y-8 shadow-xl relative overflow-hidden">
+                  <div className="absolute inset-0 bg-gradient-to-br from-blue-600/5 via-transparent to-indigo-600/5 pointer-events-none" />
+                  
+                  {/* Glowing Icon banner */}
+                  <div className="bg-gradient-to-b from-blue-600/20 to-indigo-600/5 border border-blue-500/35 p-5 rounded-2xl shadow-lg shadow-blue-500/10">
+                    <Layers className="w-10 h-10 text-blue-400 animate-pulse" />
                   </div>
-                </div>
-              </div>
 
-              {/* Right Column: Layer Config Form Fields dynamically rendered */}
-              <div className="lg:col-span-8 bg-[#0B0F19] rounded-xl border border-[#1E293B] p-5 flex flex-col space-y-4">
+                  <div className="space-y-3 max-w-2xl">
+                    <h2 className="text-xl md:text-2xl font-bold text-slate-100 tracking-tight">
+                      思博伦 & Ixia 级 — 可视化多协议报文堆叠构造工场
+                    </h2>
+                    <p className="text-xs md:text-sm text-slate-400 leading-relaxed font-mono">
+                      零代码可视化组装任意多层嵌套帧报头（如 Ethernet / ARP / IPv4 / IPv6 / TCP / UDP / ICMP / VXLAN ），支持注入定制值与原始 Payload 字节，进行精确的网络容错及高吞吐注入发包测试。
+                    </p>
+                  </div>
+
+                  {/* Centered Large Main Action Button */}
+                  <div className="pt-2 flex flex-col sm:flex-row items-center gap-4">
+                    <button
+                      id="add-packet-portal-btn"
+                      onClick={() => {
+                        // Clear stack and go to Step 1 (L2 Selection)
+                        setWizardHeaders([
+                          { id: `eth-${Date.now()}`, type: 'ETHERNET', fields: getHeaderDefaultFields('ETHERNET') }
+                        ]);
+                        setWizardStep('l3'); // starts wizard at L3 since L2 Ethernet is default-added
+                        setIsSecondScreenActive(true);
+                      }}
+                      className="bg-gradient-to-r from-blue-600 to-indigo-500 hover:from-blue-500 hover:to-indigo-400 hover:scale-[1.02] active:scale-[0.98] py-3.5 px-8 rounded-xl text-white font-bold text-sm shadow-xl shadow-blue-600/15 transition-all cursor-pointer flex items-center space-x-2"
+                    >
+                      <Plus className="w-4.5 h-4.5 stroke-[3]" />
+                      <span>增加 / 组装全新原始报文 (Add Packet)</span>
+                    </button>
+                  </div>
+
+                  {/* Quick-starts list and preloaded template gallery */}
+                  <div className="pt-6 w-full border-t border-[#1E293B]/60 max-w-4xl">
+                    <div className="text-left mb-4">
+                      <h3 className="text-xs font-bold font-mono text-slate-400 uppercase tracking-widest flex items-center space-x-1.5 justify-center sm:justify-start">
+                        <FileCode2 className="w-3.5 h-3.5 text-blue-400" />
+                        <span>或 快速加载已有预设测试模板</span>
+                      </h3>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      {[...STANDARD_PRESETS.map(p => ({ ...p, isPreset: true })), ...savedTemplates.map(t => ({ id: t.id, name: t.name, description: t.description, packet: t.packet, isPreset: false }))].map((tpl, i) => (
+                        <div
+                          key={i}
+                          onClick={() => handleLoadPreset(tpl.packet)}
+                          className="bg-[#101726]/80 hover:bg-[#101726] border border-[#1E293B] hover:border-blue-500/40 p-4 rounded-xl text-left cursor-pointer transition-all flex flex-col justify-between group"
+                        >
+                          <div>
+                            <div className="flex items-center justify-between">
+                              <span className="text-xs font-bold text-slate-200 group-hover:text-blue-400 transition-colors font-mono uppercase truncate max-w-[260px]">{tpl.name}</span>
+                              <span className={`text-[9px] px-1.5 py-0.5 rounded-sm font-bold font-mono ${tpl.isPreset ? 'bg-blue-600/10 text-blue-400 border border-blue-500/20' : 'bg-purple-600/10 text-purple-400 border border-purple-500/20'}`}>
+                                {tpl.isPreset ? '系统预设' : '我的模板'}
+                              </span>
+                            </div>
+                            <p className="text-[11px] text-slate-400 mt-1 line-clamp-2">{tpl.description}</p>
+                          </div>
+                          <div className="flex items-center justify-between text-[10px] text-blue-400/80 mt-3 border-t border-slate-800/60 pt-2 font-mono">
+                            <span>包含层: {tpl.packet.enabledLayers.join('/')}</span>
+                            <span className="group-hover:translate-x-1 transition-transform flex items-center">
+                              立即载入定制 <ChevronRight className="w-3.5 h-3.5 ml-0.5" />
+                            </span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                </div>
+              ) : (
+                /* SCREEN 2: Deep Custom Header Composition Workbench */
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                  
+                  {/* Left Column: Visual Stacking Stepper & Topology Panel */}
+                  <div className="lg:col-span-4 bg-[#0B0F19] rounded-xl border border-[#1E293B] p-4 flex flex-col space-y-4">
+                    <div className="text-xs font-bold font-mono text-slate-300 uppercase tracking-widest border-b border-[#1E293B] pb-2 flex items-center justify-between">
+                      <span>1. 协议栈拓扑</span>
+                      <Layers className="w-4 h-4 text-blue-400" />
+                    </div>
+
+                    {/* Progress tracking display */}
+                    <div className="bg-[#101726]/80 p-2.5 rounded-lg border border-[#1E293B] flex flex-col space-y-2">
+                      <div className="flex items-center justify-between text-[11px] font-mono text-slate-400">
+                        <span>当前堆叠深度:</span>
+                        <span className="text-blue-400 font-bold">{wizardHeaders.length} 层</span>
+                      </div>
+                      
+                      <div className="flex flex-wrap items-center gap-1">
+                        {wizardHeaders.map((hdr, idx) => (
+                          <div key={idx} className="flex items-center space-x-1">
+                            <span className="text-[9px] bg-blue-600/10 text-blue-300 font-bold font-mono px-1.5 py-0.5 rounded border border-blue-500/20 uppercase truncate max-w-[70px]">
+                              {hdr.type}
+                            </span>
+                            {idx < wizardHeaders.length - 1 && <ChevronRight className="w-2.5 h-2.5 text-slate-650" />}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Progressive Selection Step Logic */}
+                    <div className="bg-[#101726]/40 p-3 rounded-lg border border-dashed border-[#1E293B] space-y-3">
+                      <div className="text-[11px] font-bold font-mono text-slate-300 uppercase tracking-widest flex items-center justify-between">
+                        <span>追加下级协议头</span>
+                        <span className="text-[9px] bg-blue-550/10 text-blue-400 px-1 py-0.2 rounded font-mono">STEPPER</span>
+                      </div>
+
+                      {wizardStep === 'l2' && (
+                        <div className="space-y-2">
+                          <p className="text-[10px] text-slate-400 leading-normal">请选择添加一个 L2 链路层协议首部：</p>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setWizardHeaders(prev => [
+                                ...prev,
+                                { id: 'eth-' + Date.now(), type: 'ETHERNET', fields: getHeaderDefaultFields('ETHERNET') }
+                              ]);
+                              setWizardStep('l3');
+                            }}
+                            className="w-full bg-[#1A2333] hover:bg-blue-600/10 border border-[#2B3A55]/30 hover:border-blue-500/40 p-2 rounded text-left text-xs font-bold font-mono transition-all flex items-center justify-between cursor-pointer"
+                          >
+                            <span>ETHERNET (链路以太网)</span>
+                            <span className="text-[9px] bg-blue-600/10 text-blue-400 px-1 py-0.2 rounded">L2</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setWizardHeaders(prev => [
+                                ...prev,
+                                { id: 'arp-' + Date.now(), type: 'ARP', fields: getHeaderDefaultFields('ARP') }
+                              ]);
+                              setWizardStep('vxlan_or_done');
+                            }}
+                            className="w-full bg-[#1A2333] hover:bg-orange-650/10 border border-[#2B3A55]/30 hover:border-orange-500/40 p-2 rounded text-left text-xs font-bold font-mono transition-all flex items-center justify-between cursor-pointer"
+                          >
+                            <span>ARP (欺骗/地址映射)</span>
+                            <span className="text-[9px] bg-orange-655/10 text-orange-400 px-1 py-0.2 rounded font-semibold">L2</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setWizardStep('l3')}
+                            className="w-full text-center text-[10px] text-slate-500 hover:text-slate-300 py-1 transition-colors"
+                          >
+                            [ 跳过 L2 直接配置层 ]
+                          </button>
+                        </div>
+                      )}
+
+                      {wizardStep === 'l3' && (
+                        <div className="space-y-2">
+                          <p className="text-[10px] text-slate-400 leading-normal">请选择添加一个 L3 网络层协议首部：</p>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setWizardHeaders(prev => [
+                                ...prev,
+                                { id: 'ipv4-' + Date.now(), type: 'IPV4', fields: getHeaderDefaultFields('IPV4') }
+                              ]);
+                              setWizardStep('l4');
+                            }}
+                            className="w-full bg-[#1A2333] hover:bg-indigo-600/10 border border-[#2B3A55]/30 hover:border-indigo-500/40 p-2 rounded text-left text-xs font-bold font-mono transition-all flex items-center justify-between cursor-pointer"
+                          >
+                            <span>IPV4 (网络层主寻址)</span>
+                            <span className="text-[9px] bg-indigo-650/10 text-indigo-400 px-1 py-0.2 rounded">L3</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setWizardHeaders(prev => [
+                                ...prev,
+                                { id: 'ipv6-' + Date.now(), type: 'IPV6', fields: getHeaderDefaultFields('IPV6') }
+                              ]);
+                              setWizardStep('l4');
+                            }}
+                            className="w-full bg-[#1A2333] hover:bg-purple-600/10 border border-[#2B3A55]/30 hover:border-purple-500/40 p-2 rounded text-left text-xs font-bold font-mono transition-all flex items-center justify-between cursor-pointer"
+                          >
+                            <span>IPV6 (新一代网络层)</span>
+                            <span className="text-[9px] bg-purple-650/10 text-purple-400 px-1 py-0.2 rounded">L3</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setWizardStep('l4')}
+                            className="w-full text-center text-[10px] text-slate-500 hover:text-slate-300 py-1 transition-colors"
+                          >
+                            [ 跳过 L3 直接配置层 ]
+                          </button>
+                        </div>
+                      )}
+
+                      {wizardStep === 'l4' && (
+                        <div className="space-y-2">
+                          <p className="text-[10px] text-slate-400 leading-normal">请选择添加一个 L4 传输或诊断协议首部：</p>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setWizardHeaders(prev => [
+                                ...prev,
+                                { id: 'tcp-' + Date.now(), type: 'TCP', fields: getHeaderDefaultFields('TCP') }
+                              ]);
+                              setWizardStep('vxlan_or_done');
+                            }}
+                            className="w-full bg-[#1A2333] hover:bg-emerald-600/10 border border-[#2B3A55]/30 hover:border-emerald-500/40 p-2 rounded text-left text-xs font-bold font-mono transition-all flex items-center justify-between cursor-pointer"
+                          >
+                            <span>TCP (面向连接)</span>
+                            <span className="text-[9px] bg-emerald-600/10 text-emerald-400 px-1 py-0.2 rounded">L4</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setWizardHeaders(prev => [
+                                ...prev,
+                                { id: 'udp-' + Date.now(), type: 'UDP', fields: getHeaderDefaultFields('UDP') }
+                              ]);
+                              setWizardStep('vxlan_or_done');
+                            }}
+                            className="w-full bg-[#1A2333] hover:bg-pink-600/10 border border-[#2B3A55]/30 hover:border-pink-500/40 p-2 rounded text-left text-xs font-bold font-mono transition-all flex items-center justify-between cursor-pointer"
+                          >
+                            <span>UDP (高速报载)</span>
+                            <span className="text-[9px] bg-pink-600/10 text-pink-400 px-1 py-0.2 rounded">L4</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setWizardHeaders(prev => [
+                                ...prev,
+                                { id: 'icmp-' + Date.now(), type: 'ICMP', fields: getHeaderDefaultFields('ICMP') }
+                              ]);
+                              setWizardStep('vxlan_or_done');
+                            }}
+                            className="w-full bg-[#1A2333] hover:bg-teal-600/10 border border-[#2B3A55]/30 hover:border-teal-500/40 p-2 rounded text-left text-xs font-bold font-mono transition-all flex items-center justify-between cursor-pointer"
+                          >
+                            <span>ICMP (寻路探测回显)</span>
+                            <span className="text-[9px] bg-teal-600/10 text-teal-400 px-1 py-0.2 rounded">L4</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setWizardStep('vxlan_or_done')}
+                            className="w-full text-center text-[10px] text-slate-500 hover:text-slate-300 py-1 transition-colors"
+                          >
+                            [ 跳过 L4 直接配置层 ]
+                          </button>
+                        </div>
+                      )}
+
+                      {wizardStep === 'vxlan_or_done' && (
+                        <div className="space-y-3">
+                          <p className="text-[10px] text-[#22C55E] font-bold leading-normal">协议头当前已成功堆栈 🚀</p>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setWizardHeaders(prev => [
+                                ...prev,
+                                { id: 'vxlan-' + Date.now(), type: 'VXLAN', fields: getHeaderDefaultFields('VXLAN') }
+                              ]);
+                              // Restart stepper from L2 for nested headers inside tunnel
+                              setWizardStep('l2');
+                            }}
+                            className="w-full bg-[#201c34] hover:bg-[#2d274c] border border-fuchsia-500/40 text-fuchsia-300 py-2 px-2.5 rounded text-xs font-bold font-mono transition-all flex items-center justify-between cursor-pointer"
+                          >
+                            <span>🚀 注入 VXLAN 隧道再封装 ...</span>
+                            <span className="text-[9px] bg-fuchsia-500/20 text-fuchsia-200 px-1.5 py-0.5 rounded">Overlay</span>
+                          </button>
+                          
+                          <div className="border-t border-slate-800/80 my-1 pt-1"></div>
+
+                          <button
+                            type="button"
+                            onClick={() => setWizardStep('l2')}
+                            className="w-full bg-[#1E293B] hover:bg-slate-800 border border-slate-750 text-slate-300 py-1.5 rounded text-[10px] font-mono transition-all cursor-pointer"
+                          >
+                            继续向后追加首部
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setWizardHeaders([]);
+                              setWizardStep('l2');
+                            }}
+                            className="w-full text-rose-400 hover:text-rose-300 text-[10px] font-mono hover:underline text-center"
+                          >
+                            🗑️ 重置清空当前协议堆栈
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Right Column: Layer Config Form Fields dynamically rendered */}
+                  <div className="lg:col-span-8 bg-[#0B0F19] rounded-xl border border-[#1E293B] p-5 flex flex-col space-y-4" id="right-column-container">
                 
                 {/* Visual Active Header path indicator */}
                 <div className="flex items-center justify-between border-b border-[#1E293B] pb-3">
@@ -1145,6 +1492,8 @@ export default function App() {
               </div>
             </div>
           )}
+        </div>
+      )}
 
           {/* TAB 2: Dynamic Packet Capture stream grid & charts */}
           {activeTab === 'monitor' && (
