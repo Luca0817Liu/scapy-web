@@ -1,0 +1,8 @@
+{
+  "name": "可视化网络报文构造与发包测试平台",
+  "description": "类思博伦/Ixia的专业网络测试工具，支持可视化构造Ethernet、ARP、IP、TCP、UDP、ICMP、RAW原始报文，并支持物理发包与在线仿真测试功能。",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
